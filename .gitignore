@@ -1,0 +1,58 @@
+# common dependencies & build directories
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+.next/
+out/
+build/
+dist/
+.turbo/
+.cache/
+.parcel-cache/
+.vite/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# secrets & credentials
+.env
+.env.*
+!.env.example
+.env.local
+.env.development.local
+.env.production.local
+provider_config.json
+screenshots/token.txt
+.aws/
+azureauth.json
+service-account*.json
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# deploy / hosting
+.vercel
+.netlify/
+
+# pipeline runtime outputs
+cycles/data/
+cycles/manifests/
+cycles/state/
+logs/
+*.backup_before_mv_*

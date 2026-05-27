@@ -1,0 +1,15 @@
+{
+  "provider": "apify",
+  "apify": {
+    "api_token": "PASTE_YOUR_APIFY_API_TOKEN_HERE",
+    "actor_id": "VJ5w50TP6mAbyimyO",
+    "input_key": "emails"
+  },
+  "defaults": {
+    "input_file": "emails.csv",
+    "output_file": "validated_emails.csv",
+    "batch_size": 200,
+    "email_column": null,
+    "force_permission_level": null
+  }
+}

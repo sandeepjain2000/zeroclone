@@ -1,0 +1,3 @@
+python validate_emails.py --input "emails.csv" --batch-size 100
+
+python validate_emails.py --input "emails.csv" --output "validated_emails.csv" --batch-size 100 --config "provider_config.json"
