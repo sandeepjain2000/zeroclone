@@ -19,7 +19,7 @@ if errorlevel 1 goto :fail
 git commit -m "%msg%"
 if errorlevel 1 (
   echo.
-  echo No new commit created (nothing to commit or commit failed).
+  echo No new commit created ^(nothing to commit or commit failed^).
 )
 
 echo.
