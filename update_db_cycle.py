@@ -5,6 +5,7 @@ Apply completed validation cycles to linkedin_data.db and employee_email_state.c
 - Reads validation_manifest.csv for status=completed (or --validation-cycle N).
 - Upserts Million Verifier fields into zerobounce_validation.
 - Updates per-employee format status for the next extraction stage.
+- Refreshes CVL SQLite views (apply_validation_views.py) unless --skip-views.
 
 Usage:
   python update_db_cycle.py
@@ -19,6 +20,7 @@ import csv
 import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +32,7 @@ from cycle_registry import (
     EXTRACTION_MANIFEST,
     VALIDATION_FIELDS,
     VALIDATION_MANIFEST,
+    apply_validation_views_script,
     linkedin_db_path,
     read_manifest,
     resolve_data_path,
@@ -41,6 +44,12 @@ from email_formats import (
     format_email_column,
     format_status_column,
     is_mv_valid,
+)
+from file_registry import (
+    count_open_unprocessed,
+    ensure_registry_db,
+    log_unprocessed_summary,
+    mark_db_updated,
 )
 from company_format_state import (
     apply_probe_validation_results,
@@ -133,6 +142,18 @@ def apply_row_to_employee_state(state: dict[str, dict], row: dict) -> None:
     state[ekey] = rec
 
 
+def refresh_cvl_validation_views() -> int:
+    """Sync employee_email_state.csv into linkedin_data.db and rebuild SQL views."""
+    script = apply_validation_views_script()
+    if not script.is_file():
+        logger.error("CVL views script not found: %s", script)
+        return 1
+    cmd = [sys.executable, str(script)]
+    logger.info("Refreshing CVL validation views: %s", script)
+    print(f"\n>>> {' '.join(cmd)}\n")
+    return subprocess.call(cmd)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -140,7 +161,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--source-batch-prefix", default="mv_cycle")
     p.add_argument("--no-backup", action="store_true")
     p.add_argument("--list-ready", action="store_true")
+    p.add_argument(
+        "--skip-views",
+        action="store_true",
+        help="Do not run apply_validation_views.py after DB update",
+    )
     return p.parse_args()
+
+
+def _validation_ready_for_db(row: dict) -> bool:
+    """Completed, or partial only when every validatable email has a result."""
+    notes = (row.get("notes") or "").strip()
+    if notes == "db_updated":
+        return False
+    st = (row.get("status") or "").strip()
+    if st == "completed":
+        return True
+    if st == "partial":
+        processed = int(row.get("rows_processed") or 0)
+        total = int(row.get("rows_total") or 0)
+        return total > 0 and processed >= total
+    return False
 
 
 def find_validation_target(cycle_number: int | None) -> dict | None:
@@ -150,17 +191,16 @@ def find_validation_target(cycle_number: int | None) -> dict | None:
             if int(row.get("cycle_number") or 0) == cycle_number:
                 return row
         return None
-    for row in rows:
-        st = (row.get("status") or "").strip()
-        notes = (row.get("notes") or "").strip()
-        if st == "completed" and notes != "db_updated":
-            return row
-    return None
+    ready = [r for r in rows if _validation_ready_for_db(r)]
+    if not ready:
+        return None
+    return max(ready, key=lambda r: int(r.get("cycle_number") or 0))
 
 
 def main() -> int:
     args = parse_args()
     setup_pipeline_logging("update_db_cycle")
+    ensure_registry_db()
 
     if args.list_ready:
         for row in read_manifest(VALIDATION_MANIFEST, VALIDATION_FIELDS):
@@ -171,11 +211,26 @@ def main() -> int:
                 row.get("notes"),
                 row.get("validation_file"),
             )
+        n_open = count_open_unprocessed()
+        if n_open:
+            logger.info("Unprocessed validation backlog: %s row(s)", n_open)
         return 0
 
     val_row = find_validation_target(args.validation_cycle)
     if not val_row:
-        logger.error("No completed validation pending DB update.")
+        logger.error(
+            "No validation pending DB update (need status=completed, or partial "
+            "with all validatable emails processed)."
+        )
+        return 2 if args.validation_cycle is None else 1
+
+    if not _validation_ready_for_db(val_row):
+        logger.error(
+            "Validation cycle %s is partial (%s/%s) — resume validate_cycle.py first.",
+            val_row.get("cycle_number"),
+            val_row.get("rows_processed"),
+            val_row.get("rows_total"),
+        )
         return 1
 
     val_cycle = int(val_row["cycle_number"])
@@ -295,6 +350,12 @@ def main() -> int:
             {"status": "db_updated"},
         )
 
+    mark_db_updated(
+        val_row.get("extraction_file") or "",
+        val_row.get("validation_file") or "",
+    )
+    log_unprocessed_summary(logger)
+
     summary = {
         "validation_cycle": val_cycle,
         "csv": str(csv_path),
@@ -308,6 +369,13 @@ def main() -> int:
         "company_probe_failed": probe_failed,
     }
     logger.info("DB update summary: %s", json.dumps(summary, indent=2))
+
+    if not args.skip_views:
+        code = refresh_cvl_validation_views()
+        if code != 0:
+            logger.error("CVL validation views refresh failed (exit %s)", code)
+            return code
+
     return 0
 
 

@@ -4,7 +4,7 @@ Extract up to 500 guessed staff (and optionally info@) addresses from the CVL
 LinkedIn DB that do not yet appear in email_attempts. Writes a single-column CSV
 for tools like validate_emails.py / ZeroBounce.
 
-DB path: sibling folder ../CVL/data/db/linkedin_data.db
+DB path: sibling folder ../CVL-ScraperLinkedIn_SendMails/data/db/linkedin_data.db
 Output:  unsent_emails_500.csv (column: email)
 """
 
@@ -17,7 +17,7 @@ import unicodedata
 from pathlib import Path
 
 ZERONE = Path(__file__).resolve().parent
-CVL_DB = ZERONE.parent / "CVL" / "data" / "db" / "linkedin_data.db"
+CVL_DB = ZERONE.parent / "CVL-ScraperLinkedIn_SendMails" / "data" / "db" / "linkedin_data.db"
 OUT_CSV = ZERONE / "unsent_emails_500.csv"
 LIMIT = 500
 

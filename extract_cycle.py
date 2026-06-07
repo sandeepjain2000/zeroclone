@@ -26,6 +26,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from file_registry import (
+    FileRegistryError,
+    ensure_registry_db,
+    register_processed_file,
+)
 from pipeline_logging import get_logger, setup_pipeline_logging
 from cycle_registry import (
     DATA_DIR,
@@ -254,6 +259,7 @@ def main() -> int:
     args = parse_args()
     setup_pipeline_logging("extract_cycle")
     ensure_dirs()
+    ensure_registry_db()
 
     if not args.db.is_file():
         logger.error("Database not found: %s", args.db)
@@ -397,6 +403,7 @@ def main() -> int:
         f"probe_em={stats['probe_emails']} expand_em={stats['expand_emails']}"
     )
     now = datetime.now(timezone.utc).isoformat()
+    extract_rel = relative_data_path(out_name)
     append_manifest_row(
         EXTRACTION_MANIFEST,
         EXTRACTION_FIELDS,
@@ -404,12 +411,25 @@ def main() -> int:
             "cycle_number": cycle_number,
             "created_at": now,
             "email_format": primary_format,
-            "extraction_file": relative_data_path(out_name),
+            "extraction_file": extract_rel,
             "row_count": len(collected),
             "status": "pending_validation",
             "notes": notes,
         },
     )
+    try:
+        register_processed_file(
+            extract_rel,
+            file_kind="extract",
+            cycle_number=cycle_number,
+            extraction_cycle=cycle_number,
+            status="pending_validation",
+            rows_total=len(collected),
+            notes=notes,
+        )
+    except FileRegistryError as exc:
+        logger.error("Extract file registry conflict: %s", exc)
+        return 1
 
     logger.info("Cycle %s | company-probe pipeline", cycle_number)
     logger.info(

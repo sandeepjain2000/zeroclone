@@ -58,6 +58,19 @@ from validate_emails import (
     DEFAULT_CONFIG,
 )
 
+from file_registry import (
+    FileRegistryError,
+    assert_can_validate_extraction,
+    assert_new_output_filename,
+    ensure_registry_db,
+    find_open_validation_output,
+    log_unprocessed_summary,
+    register_processed_file,
+    resolve_unprocessed_for_extraction,
+    save_unprocessed_rows,
+    update_processed_file,
+    upsert_processed_file,
+)
 from pipeline_logging import get_logger, setup_pipeline_logging
 
 logger = get_logger("validate_cycle")
@@ -106,6 +119,39 @@ def find_validation_row(cycle_number: int) -> dict | None:
     return None
 
 
+def find_latest_open_validation(ext_cycle: int) -> dict | None:
+    """
+    Reuse the newest validation job for this extraction instead of creating
+    another Apify run on the same extract CSV (avoids duplicate billing).
+    """
+    open_rows: list[dict] = []
+    for row in read_manifest(VALIDATION_MANIFEST, VALIDATION_FIELDS):
+        if int(row.get("extraction_cycle_number") or 0) != ext_cycle:
+            continue
+        if (row.get("notes") or "").strip() == "db_updated":
+            continue
+        if (row.get("status") or "").strip() in ("partial", "running", "completed"):
+            open_rows.append(row)
+    if not open_rows:
+        return None
+    return max(open_rows, key=lambda r: int(r.get("cycle_number") or 0))
+
+
+def _resolve_status(
+    *,
+    api_completed: bool,
+    processed: int,
+    validatable_total: int,
+    err: str,
+) -> tuple[str, str]:
+    """Mark completed when every validatable email in the extract has a result."""
+    if validatable_total > 0 and processed >= validatable_total:
+        return "completed", ""
+    if api_completed and processed >= validatable_total:
+        return "completed", ""
+    return "partial", err
+
+
 def count_results(results_by_email: dict) -> tuple[int, int, int]:
     ok = invalid = 0
     for item in results_by_email.values():
@@ -139,6 +185,7 @@ def list_pending() -> None:
 def main() -> int:
     args = parse_args()
     ensure_dirs()
+    ensure_registry_db()
     setup_pipeline_logging("validate_cycle", also_configure=("validate_emails",))
 
     if args.list_pending:
@@ -168,45 +215,38 @@ def main() -> int:
         if not extraction_row:
             logger.error("No pending_validation extraction found.")
             return 1
+        validation_row = find_latest_open_validation(int(extraction_row["cycle_number"]))
+        if validation_row:
+            logger.info(
+                "Reusing validation cycle %s for extraction %s (same batch — "
+                "not creating a duplicate Apify run).",
+                validation_row.get("cycle_number"),
+                extraction_row.get("cycle_number"),
+            )
 
     ext_cycle = int(extraction_row["cycle_number"])
     email_format = extraction_row.get("email_format", "")
-    input_path = resolve_data_path(extraction_row["extraction_file"])
+    extraction_rel = extraction_row["extraction_file"]
+    input_path = resolve_data_path(extraction_rel)
     if not input_path.exists():
         logger.error("Extraction file missing: %s", input_path)
         return 1
 
-    tag = timestamp_tag()
-    if validation_row:
-        val_cycle = int(validation_row["cycle_number"])
-        out_name = Path(validation_row["validation_file"]).name
-        out_path = resolve_data_path(validation_row["validation_file"])
-        resume = args.resume or (validation_row.get("status") == "partial")
-    else:
-        val_cycle = next_cycle_number(VALIDATION_MANIFEST)
-        out_name = validation_filename(email_format, val_cycle, tag)
-        out_path = DATA_DIR / out_name
-        resume = args.resume
-        append_manifest_row(
-            VALIDATION_MANIFEST,
-            VALIDATION_FIELDS,
-            {
-                "cycle_number": val_cycle,
-                "extraction_cycle_number": ext_cycle,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": "",
-                "email_format": email_format,
-                "extraction_file": extraction_row["extraction_file"],
-                "validation_file": relative_data_path(out_name),
-                "rows_total": extraction_row.get("row_count", 0),
-                "rows_processed": 0,
-                "rows_ok": 0,
-                "rows_invalid": 0,
-                "status": "running",
-                "error_message": "",
-                "notes": "",
-            },
+    try:
+        if not validation_row:
+            assert_can_validate_extraction(extraction_rel)
+        upsert_processed_file(
+            extraction_rel,
+            file_kind="extract",
+            cycle_number=ext_cycle,
+            extraction_cycle=ext_cycle,
+            status=(extraction_row.get("status") or "pending_validation"),
+            rows_total=int(extraction_row.get("row_count") or 0),
+            notes="registered_at_validate",
         )
+    except FileRegistryError as exc:
+        logger.error("%s", exc)
+        return 1
 
     original_headers, _, rows = read_input_csv(str(input_path), "email")
     unique_emails: list[str] = []
@@ -220,12 +260,84 @@ def main() -> int:
             seen.add(key)
             unique_emails.append(email)
 
+    validatable_total = len(seen)
+
+    tag = timestamp_tag()
+    validation_rel = ""
+    if validation_row:
+        val_cycle = int(validation_row["cycle_number"])
+        out_name = Path(validation_row["validation_file"]).name
+        validation_rel = validation_row["validation_file"]
+        out_path = resolve_data_path(validation_rel)
+        resume = args.resume or out_path.exists() or (
+            (validation_row.get("status") or "") == "partial"
+        )
+        upsert_processed_file(
+            validation_rel,
+            file_kind="validation_output",
+            validation_cycle=val_cycle,
+            extraction_cycle=ext_cycle,
+            status=(validation_row.get("status") or "running"),
+            rows_total=validatable_total,
+            rows_processed=int(validation_row.get("rows_processed") or 0),
+            notes=f"extract={extraction_rel}",
+        )
+    else:
+        open_reg = find_open_validation_output(extraction_rel)
+        if open_reg:
+            logger.error(
+                "Partial validation already registered for this extract (%s). "
+                "Resume with: validate_cycle.py --validation-cycle %s --resume",
+                open_reg["file_path"],
+                open_reg.get("validation_cycle"),
+            )
+            return 1
+        val_cycle = next_cycle_number(VALIDATION_MANIFEST)
+        out_name = validation_filename(email_format, val_cycle, tag)
+        validation_rel = relative_data_path(out_name)
+        try:
+            assert_new_output_filename(out_name)
+        except FileRegistryError as exc:
+            logger.error("%s", exc)
+            return 1
+        out_path = DATA_DIR / out_name
+        resume = args.resume
+        register_processed_file(
+            validation_rel,
+            file_kind="validation_output",
+            validation_cycle=val_cycle,
+            extraction_cycle=ext_cycle,
+            status="running",
+            rows_total=validatable_total,
+            notes=f"extract={extraction_rel}",
+        )
+        append_manifest_row(
+            VALIDATION_MANIFEST,
+            VALIDATION_FIELDS,
+            {
+                "cycle_number": val_cycle,
+                "extraction_cycle_number": ext_cycle,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": "",
+                "email_format": email_format,
+                "extraction_file": extraction_row["extraction_file"],
+                "validation_file": validation_rel,
+                "rows_total": validatable_total,
+                "rows_processed": 0,
+                "rows_ok": 0,
+                "rows_invalid": 0,
+                "status": "running",
+                "error_message": "",
+                "notes": "",
+            },
+        )
+
     existing_results = {}
     if resume and out_path.exists():
         existing_results = load_existing_results_from_output(out_path)
         unique_emails = [e for e in unique_emails if e.lower() not in existing_results]
 
-    rows_total = int(extraction_row.get("row_count") or len(seen))
+    rows_total = validatable_total
     now = datetime.now(timezone.utc).isoformat()
 
     if not unique_emails and existing_results:
@@ -250,7 +362,15 @@ def main() -> int:
             ext_cycle,
             {"status": "validated"},
         )
+        update_processed_file(
+            validation_rel,
+            status="completed",
+            rows_processed=processed,
+            rows_total=validatable_total,
+        )
+        resolve_unprocessed_for_extraction(extraction_rel)
         logger.info("Already complete. %s", out_path)
+        log_unprocessed_summary(logger)
         return 0
 
     client = ApifyClient(provider["token"])
@@ -278,9 +398,12 @@ def main() -> int:
 
     write_output_csv(str(out_path), original_headers, rows, merged)
     processed, ok, invalid = count_results(merged)
-    status = "completed" if completed and processed >= rows_total else "partial"
-    if completed and processed < rows_total:
-        status = "partial"
+    status, err_msg = _resolve_status(
+        api_completed=completed,
+        processed=processed,
+        validatable_total=validatable_total,
+        err=err or "",
+    )
 
     update_manifest_row(
         VALIDATION_MANIFEST,
@@ -288,11 +411,12 @@ def main() -> int:
         val_cycle,
         {
             "updated_at": now,
+            "rows_total": validatable_total,
             "rows_processed": processed,
             "rows_ok": ok,
             "rows_invalid": invalid,
             "status": status,
-            "error_message": err if status == "partial" else "",
+            "error_message": err_msg,
         },
     )
     if status == "completed":
@@ -302,6 +426,29 @@ def main() -> int:
             ext_cycle,
             {"status": "validated"},
         )
+        update_processed_file(extraction_rel, status="validated")
+        resolve_unprocessed_for_extraction(extraction_rel)
+    else:
+        n_unproc = save_unprocessed_rows(
+            rows,
+            merged,
+            extraction_file=extraction_rel,
+            validation_file=validation_rel,
+            validation_cycle=val_cycle,
+            reason=err_msg or "partial_validation",
+        )
+        logger.info(
+            "  Saved %s unprocessed email(s) to validation_unprocessed table",
+            n_unproc,
+        )
+
+    update_processed_file(
+        validation_rel,
+        status=status,
+        rows_processed=processed,
+        rows_total=validatable_total,
+        notes=f"extract={extraction_rel};ok={ok};invalid={invalid}",
+    )
 
     logger.info(
         "Validation cycle %s | extraction %s | %s | %s/%s processed (ok=%s invalid=%s)",
@@ -314,6 +461,7 @@ def main() -> int:
         invalid,
     )
     logger.info("Output: %s", out_path)
+    log_unprocessed_summary(logger)
     return 0 if status == "completed" else 3
 
 

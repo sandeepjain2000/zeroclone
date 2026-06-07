@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Run one full pipeline step: extract → validate → update DB → refresh CVL views.
+Run one full pipeline step: extract → validate → update DB (+ CVL views).
 
 Format stage is chosen automatically by extract_cycle.py (CVL cascade order).
+update_db_cycle.py refreshes apply_validation_views.py automatically.
 
-Stops after validation if Apify quota is hit (exit 3); re-run with:
-  python validate_cycle.py --resume
-  python update_db_cycle.py
+If validation stops mid-batch (Apify quota), re-run run_cycle_resume.bat.
+Each run_cycle validates the current extract once (resumes if partial), updates DB,
+then the next run_cycle extracts a new batch.
 
 Usage:
   python run_cycle.py
@@ -19,8 +20,6 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
-
-from cycle_registry import apply_validation_views_script
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -36,8 +35,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=500)
     p.add_argument(
         "--steps",
-        default="extract,validate,db,views",
-        help="Comma-separated: extract, validate, db, views",
+        default="extract,validate,db",
+        help="Comma-separated: extract, validate, db (views run inside update_db_cycle)",
     )
     p.add_argument("--resume-validation", action="store_true")
     p.add_argument("--extraction-cycle", type=int, default=None)
@@ -69,8 +68,10 @@ def main() -> int:
         if code not in (0, 3):
             return code
         if code == 3:
-            print("\nValidation partial — re-run: python validate_cycle.py --resume")
-            return 3
+            print(
+                "\nValidation still partial (quota or unfinished emails) — "
+                "will still try DB update if this batch is complete enough."
+            )
 
     if "db" in steps:
         extra = []
@@ -78,18 +79,16 @@ def main() -> int:
             extra += ["--validation-cycle", str(args.validation_cycle)]
         code = run_script("update_db_cycle.py", extra)
         if code != 0:
+            if code == 2:
+                print(
+                    "\nDB update skipped — finish validation with run_cycle_resume.bat, "
+                    "then update_db_cycle.py"
+                )
             return code
 
     if "views" in steps:
-        apply_views = apply_validation_views_script()
-        if not apply_views.is_file():
-            print(f"\nMissing views script: {apply_views}")
-            return 1
-        cmd = [sys.executable, str(apply_views)]
-        print(f"\n>>> {' '.join(cmd)}\n")
-        code = subprocess.call(cmd)
-        if code != 0:
-            return code
+        # Legacy alias: views refresh is part of update_db_cycle since 2026-06.
+        print("\n(note: 'views' step is included in update_db_cycle — skipping duplicate run)\n")
 
     print("\nCycle step(s) finished.")
     return code
