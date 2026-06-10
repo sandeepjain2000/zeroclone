@@ -308,7 +308,7 @@ def main() -> int:
         if outcome == "works":
             probe_works += 1
             logger.info(
-                "  Company probe OK — %s @ %s format=%s (%s/%s valid)",
+                "  Company probe OK - %s @ %s format=%s (%s/%s valid)",
                 cname,
                 domain,
                 fmt,
@@ -318,7 +318,7 @@ def main() -> int:
         elif outcome == "failed":
             probe_failed += 1
             logger.info(
-                "  Company probe failed — %s @ %s format=%s → try next format",
+                "  Company probe failed - %s @ %s format=%s -> try next format",
                 cname,
                 domain,
                 fmt,
@@ -333,6 +333,12 @@ def main() -> int:
             probe_failed,
             len(probe_groups),
         )
+        if probe_failed:
+            logger.info(
+                "  Note: probe failures are normal - each company tests 2 sample "
+                "emails per format; invalid probes retry the next format on the "
+                "next extract cycle (not a pipeline error)."
+            )
 
     now = datetime.now(timezone.utc).isoformat()
     update_manifest_row(

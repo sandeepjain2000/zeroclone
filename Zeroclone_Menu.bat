@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions
+chcp 65001 >nul
 cd /d "%~dp0"
 
 REM Wide layout so descriptions use the terminal width. Tweak ZC_COLS if text wraps oddly on your monitor.
