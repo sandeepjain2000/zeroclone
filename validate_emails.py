@@ -257,6 +257,7 @@ def validate_batches(
     permission_level=None,
     start_batch_index=0,
     existing_results=None,
+    on_actor_finished=None,
 ):
     """
     Validate emails in Apify batches.
@@ -298,6 +299,9 @@ def validate_batches(
                 logger.warning("API quota/limit hit after partial run: %s", error)
                 return results_by_email, ordered_results, False, str(error)
             raise
+
+        if on_actor_finished:
+            on_actor_finished(batch_number, total_batches, len(batch))
 
         dataset_id = run["defaultDatasetId"]
         items = list(client.dataset(dataset_id).iterate_items())
